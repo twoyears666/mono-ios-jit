@@ -1,0 +1,22 @@
+name: Check Runner
+
+# 临时探针：确认这个仓库的 Actions 到底能不能起 job。
+# 只跑一条命令，用来区分「仓库/账号级限制」和「workflow 本身的问题」。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    name: 探活
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印环境
+        run: echo "alive on $(uname -a)"
