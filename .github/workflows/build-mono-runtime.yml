@@ -1,0 +1,108 @@
+name: Build Mono Runtime
+
+# 目标：产出一个「开着 JIT」的 arm64 Mono 运行时 dylib，
+# 再把它的构建平台改成 iOS，供 TrollStore 注入的加载器 dlopen。
+# 官方 ios-arm64 运行时包是 -DDISABLE_JIT 编的，JIT trampoline全是 assert，
+# 所以必须自己编一份（PojavLauncher 自带 JRE 是同一思路）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUNTIME_TAG: v8.0.4
+  OUT_DYLIB: libmonosgen-ios-arm64-jit.dylib
+
+jobs:
+  # === 编译运行时 —— 在本机 macOS arm64 上原生编，产物才是 arm64 JIT ===
+  build:
+    name: 编译运行时
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - name: 打印工具链版本
+        run: |
+          sw_vers
+          xcodebuild -version
+          clang --version | head -1
+
+      - name: 拉取 dotnet/runtime 源码
+        run: |
+          curl -fsSL "https://codeload.github.com/dotnet/runtime/tar.gz/refs/tags/${RUNTIME_TAG}" -o runtime.tgz
+          mkdir -p runtime && tar xzf runtime.tgz -C runtime --strip-components=1
+          ls runtime | head
+
+      - name: 编译 Mono 运行库
+        working-directory: runtime
+        run: |
+          ./build.sh mono.runtime -os osx -arch arm64 -c Release -ci 2>&1 | tee ../build.log
+
+      - name: 找出产物 dylib
+        run: |
+          find runtime/artifacts -name 'libmonosgen-2.0.dylib' -o -name 'libmonosgen-2.0.*.dylib' | head -20
+
+      - name: 校验 JIT trampoline 是真实现
+        run: |
+          SRC=$(find runtime/artifacts -name 'libmonosgen-2.0*.dylib' | head -1)
+          echo "产物: $SRC"
+          # 有 JIT 的版本里，这些符号的实现在 tramp-arm64.c，
+          # 反汇编里不该只有一条 brk #1（assert）
+          nm -g "$SRC" | grep -E "mono_arch_create_sdb_trampoline|mono_arch_get_unbox_trampoline|mono_jit_init_version" || true
+          echo "$SRC" > dylib_path.txt
+
+      - name: 改构建平台为 iOS 并签名
+        run: |
+          SRC=$(cat dylib_path.txt)
+          mkdir -p out
+          cp "$SRC" "out/$OUT_DYLIB"
+          # macOS 版 mono 与 iOS 的 CPU/ABI 一致，只登记的平台号不同
+          vtool -set-build-version ios 15.0 16.4 -replace -output "out/$OUT_DYLIB" "out/$OUT_DYLIB"
+          codesign -f -s - "out/$OUT_DYLIB"
+          otool -l "out/$OUT_DYLIB" | grep -A3 LC_BUILD_VERSION | head -6
+          codesign -dvv "out/$OUT_DYLIB" 2>&1 | head -5
+          ls -la out
+
+      - name: 打包产物
+        run: |
+          mkdir -p pkg
+          cp "out/$OUT_DYLIB" pkg/
+          # 托管 BCL 与平台无关，直接沿用官方 ios-arm64 运行时包里的那一份
+          curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.mono.ios-arm64/8.0.20/microsoft.netcore.app.runtime.mono.ios-arm64.8.0.20.nupkg" -o pack.nupkg
+          mkdir -p bcl && (cd bcl && unzip -qo ../pack.nupkg 'runtimes/ios-arm64/native/*.dll' 'runtimes/ios-arm64/native/*.dat')
+          mkdir -p pkg/bcl && cp bcl/runtimes/ios-arm64/native/* pkg/bcl/
+          cd pkg && zip -qry ../Mono-IOS-JIT.zip . && cd ..
+          ls -la Mono-IOS-JIT.zip
+
+      - name: 汇总编译错误（失败时）
+        if: failure()
+        run: |
+          echo "== 构建日志尾部 =="
+          tail -80 build.log 2>/dev/null || echo "（没有 build.log）"
+
+      - name: 上传运行时产物
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Mono-IOS-JIT
+          path: Mono-IOS-JIT.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传编译日志（失败时）
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
