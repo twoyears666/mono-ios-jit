@@ -38,14 +38,16 @@ jobs:
 
       - name: 拉取 dotnet/runtime 源码
         run: |
-          curl -fsSL "https://codeload.github.com/dotnet/runtime/tar.gz/refs/tags/${RUNTIME_TAG}" -o runtime.tgz
-          mkdir -p runtime && tar xzf runtime.tgz -C runtime --strip-components=1
+          # 必须用 git clone：tarball 没有 git 元数据，versioning.targets 会因为
+          # 生成不了 Native SourceLink 文件而直接报错
+          git clone --depth 1 --branch "${RUNTIME_TAG}" https://github.com/dotnet/runtime.git runtime
           ls runtime | head
 
       - name: 编译 Mono 运行库
         working-directory: runtime
         run: |
-          ./build.sh mono.runtime -os osx -arch arm64 -c Release -ci 2>&1 | tee ../build.log
+          set -o pipefail   # 不加的话 tee 会把 build.sh 的失败退出码吞掉
+          ./build.sh mono.runtime -os osx -arch arm64 -c Release 2>&1 | tee ../build.log
 
       - name: 找出产物 dylib
         run: |
