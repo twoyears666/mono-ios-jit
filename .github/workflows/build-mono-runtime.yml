@@ -94,10 +94,22 @@ jobs:
             LIB=$(find runtime/artifacts -name 'libmonosgen-2.0.a' | head -1)
             echo "静态库: $LIB"
             test -n "$LIB"
+            # 组件（debugger / diagnostics / hot_reload）都是独立静态库，要一起链；
+            # ICU 全球化入口 iOS 上没有，给个空实现顶掉
+            COMPS=$(find runtime/artifacts -name '*-static.a' | tr '\n' ' ')
+            echo "组件库: $COMPS"
+            cat > stub.c <<'C'
+            /* 静态 mono 引用了 ICU 全球化入口，iOS 上走不到这里 */
+            void *GlobalizationResolveDllImport(const char *name)
+            {
+                (void)name;
+                return 0;
+            }
+            C
             # 静态 mono 需要整包链入：icall 注册表靠 section 里的符号表，
             # 不加 -all_load 链接器会把没人引用的 icall 全丢掉
             clang -arch arm64 -dynamiclib -o "out/$OUT_DYLIB" \
-              -Wl,-all_load "$LIB" \
+              -Wl,-all_load "$LIB" $COMPS stub.c \
               -framework CoreFoundation -framework Foundation -framework Security \
               -framework SystemConfiguration -lz -liconv -lc++ 2>&1 | tail -20
           fi
