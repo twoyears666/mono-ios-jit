@@ -91,12 +91,16 @@ jobs:
           if [ -n "$SRC" ] && [ -f "$SRC" ]; then
             cp "$SRC" "out/$OUT_DYLIB"
           else
-            LIB=$(find runtime/artifacts -name 'libmonosgen-2.0.a' | head -1)
+            LIB=$(find runtime/artifacts -name 'libmonosgen-2.0.a' ! -path '*cross*' ! -path '*/bin/*' | head -1)
             echo "静态库: $LIB"
             test -n "$LIB"
-            # 组件（debugger / diagnostics / hot_reload）都是独立静态库，要一起链；
-            # ICU 全球化入口 iOS 上没有，给个空实现顶掉
-            COMPS=$(find runtime/artifacts -name '*-static.a' | tr '\n' ' ')
+            # 组件（debugger / diagnostics / hot_reload / marshal-ilgen）是独立静态库，要一起链。
+            # 只在静态库同目录取，且排除 stub 版：
+            #   - 同一份库在 out/lib、cross/out/lib、bin/ 各有一份副本，
+            #     全收进来会让 -all_load 链进三份实现，报一堆 duplicate symbol
+            #   - *-stub-static.a 与真实组件定义同名入口，只留真实组件
+            LIBDIR=$(dirname "$LIB")
+            COMPS=$(find "$LIBDIR" -maxdepth 1 -name '*-static.a' ! -name '*-stub-static.a' | tr '\n' ' ')
             echo "组件库: $COMPS"
             # 用 printf 写 stub：YAML 块标量会给每行补缩进，
             # heredoc 的结束符会被缩进带走，导致 shell 提前报 EOF
