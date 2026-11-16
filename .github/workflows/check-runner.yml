@@ -16,7 +16,7 @@ permissions:
 jobs:
   ping:
     name: 探活
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: 打印环境
         run: echo "alive on $(uname -a)"
