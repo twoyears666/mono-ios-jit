@@ -43,6 +43,24 @@ jobs:
           git clone --depth 1 --branch "${RUNTIME_TAG}" https://github.com/dotnet/runtime.git runtime
           ls runtime | head
 
+      - name: 修补已知编译错误
+        working-directory: runtime
+        run: |
+          # 新版本 clang 把宏参数里的 bool 展开成 _Bool，导致 icall.c 里
+          # ICALL_SIG_TYPE_##a 拼出未定义的 ICALL_SIG_TYPE__Bool。
+          # 补一个同值别名即可（枚举值必须保持不变）。
+          python3 - <<'PY'
+          p = 'src/mono/mono/metadata/icall.c'
+          s = open(p).read()
+          if 'ICALL_SIG_TYPE__Bool' not in s:
+              s = s.replace('\tICALL_SIG_TYPE_bool     = 0x00,',
+                            '\tICALL_SIG_TYPE_bool     = 0x00,\n\tICALL_SIG_TYPE__Bool    = 0x00,', 1)
+              open(p, 'w').write(s)
+              print('已打补丁')
+          else:
+              print('补丁已存在')
+          PY
+
       - name: 编译 Mono 运行库
         working-directory: runtime
         run: |
