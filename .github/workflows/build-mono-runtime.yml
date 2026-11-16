@@ -82,9 +82,25 @@ jobs:
 
       - name: 改构建平台为 iOS 并签名
         run: |
-          SRC=$(cat dylib_path.txt)
           mkdir -p out
-          cp "$SRC" "out/$OUT_DYLIB"
+          SRC=""
+          # runtime 子集默认 -DDISABLE_SHARED_LIBS=1，只产出静态库
+          if [ -s dylib_path.txt ]; then
+            SRC=$(cat dylib_path.txt)
+          fi
+          if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+            cp "$SRC" "out/$OUT_DYLIB"
+          else
+            LIB=$(find runtime/artifacts -name 'libmonosgen-2.0.a' | head -1)
+            echo "静态库: $LIB"
+            test -n "$LIB"
+            # 静态 mono 需要整包链入：icall 注册表靠 section 里的符号表，
+            # 不加 -all_load 链接器会把没人引用的 icall 全丢掉
+            clang -arch arm64 -dynamiclib -o "out/$OUT_DYLIB" \
+              -Wl,-all_load "$LIB" \
+              -framework CoreFoundation -framework Foundation -framework Security \
+              -framework SystemConfiguration -lz -liconv -lc++ 2>&1 | tail -20
+          fi
           # macOS 版 mono 与 iOS 的 CPU/ABI 一致，只登记的平台号不同
           vtool -set-build-version ios 15.0 16.4 -replace -output "out/$OUT_DYLIB" "out/$OUT_DYLIB"
           codesign -f -s - "out/$OUT_DYLIB"
