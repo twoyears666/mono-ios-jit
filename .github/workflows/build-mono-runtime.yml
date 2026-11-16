@@ -127,12 +127,17 @@ jobs:
 
       - name: 打包产物
         run: |
-          mkdir -p pkg
-          cp "out/$OUT_DYLIB" pkg/
-          # 托管 BCL 与平台无关，直接沿用官方 ios-arm64 运行时包里的那一份
+          mkdir -p pkg/Frameworks pkg/bcl
+          cp "out/$OUT_DYLIB" pkg/Frameworks/libmonosgen-2.0.dylib
+          # 托管 BCL 与平台无关，直接沿用官方 ios-arm64 运行时包；
+          # libSystem.*.dylib 是 BCL 里 P/Invoke 的目标（Environment/Socket/加密），
+          # 少一个就会在 mono 初始化阶段抛 DllNotFoundException
           curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.mono.ios-arm64/8.0.20/microsoft.netcore.app.runtime.mono.ios-arm64.8.0.20.nupkg" -o pack.nupkg
-          mkdir -p bcl && (cd bcl && unzip -qo ../pack.nupkg 'runtimes/ios-arm64/native/*.dll' 'runtimes/ios-arm64/native/*.dat')
-          mkdir -p pkg/bcl && cp bcl/runtimes/ios-arm64/native/* pkg/bcl/
+          mkdir -p bcl && (cd bcl && unzip -qo ../pack.nupkg 'runtimes/ios-arm64/native/*.dll' 'runtimes/ios-arm64/native/*.dat' 'runtimes/ios-arm64/native/libSystem.*.dylib')
+          cp bcl/runtimes/ios-arm64/native/*.dll bcl/runtimes/ios-arm64/native/*.dat pkg/bcl/
+          cp bcl/runtimes/ios-arm64/native/libSystem.*.dylib pkg/Frameworks/
+          for f in pkg/Frameworks/*.dylib; do codesign -f -s - "$f"; done
+          ls -la pkg/Frameworks pkg/bcl | head -20
           cd pkg && zip -qry ../Mono-IOS-JIT.zip . && cd ..
           ls -la Mono-IOS-JIT.zip
 
