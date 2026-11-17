@@ -144,6 +144,13 @@ jobs:
               '    }' \
               '    if (real != 0)' \
               '        real(enabled);' \
+              '}' \
+              '/* macOS 的 syslog 被引用成 _syslog$DARWIN_EXTSN，iOS 没这个别名 */' \
+              'void ml_syslog_noop(int priority, const char *format, ...) __asm__("_syslog$DARWIN_EXTSN");' \
+              'void ml_syslog_noop(int priority, const char *format, ...)' \
+              '{' \
+              '    (void)priority;' \
+              '    (void)format;' \
               '}' > stub.c
             # 静态 mono 需要整包链入：icall 注册表靠 section 里的符号表，
             # 不加 -all_load 链接器会把没人引用的 icall 全丢掉
@@ -182,6 +189,38 @@ jobs:
           otool -l "out/$OUT_DYLIB" | grep -A3 LC_BUILD_VERSION | head -6
           codesign -dvv "out/$OUT_DYLIB" 2>&1 | head -5
           ls -la out
+
+      - name: 核对未定义符号在 iOS 上都有
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          python3 - "$SDK" "out/$OUT_DYLIB" <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          sdk, dylib = sys.argv[1], sys.argv[2]
+
+          # iOS SDK 的 tbd 里列的就是真机 dyld 能解析到的符号，全收进来做白名单
+          exported = set()
+          for path in pathlib.Path(sdk).rglob("*.tbd"):
+              try:
+                  exported.update(re.findall(r"_[\w$.]+", path.read_text(errors="ignore")))
+              except OSError:
+                  pass
+
+          def symbols(flag):
+              out = subprocess.run(["nm", flag, dylib], capture_output=True, text=True).stdout
+              return {line.split()[-1] for line in out.splitlines() if line.strip()}
+
+          undef = symbols("-u")
+          defined = symbols("-gU")
+          missing = sorted(s for s in undef - defined if s not in exported)
+          print(f"未定义符号 {len(undef)} 个，iOS 上找不到 {len(missing)} 个")
+          for name in missing:
+              print("  缺:", name)
+          sys.exit(1 if missing else 0)
+          PY
 
       - name: 打包产物
         run: |
