@@ -83,9 +83,14 @@ jobs:
           # 但把执行位剥掉**（实测 0.13.6：mprotect RWX 成功，一跳进去就崩）。
           # 所以只留一条路：代码页写入时 RW、执行时 RX，来回切。
           # 两个补丁：映射阶段先要 RW 并登记区域；codeman 的写保护开关改成 mprotect。
-          externs = ('\n/* 由 stub.c 提供：iOS 判定与代码页登记/mprotect 切换 */\n'
-                     'extern int ml_ios_jit_wx (void);\n'
-                     'extern void ml_jit_pages_register (void *addr, size_t length);\n')
+          externs = ('\nextern int ml_ios_jit_wx (void);\n'
+                     'extern void ml_jit_pages_register (void *addr, size_t length);\n'
+                     'extern void ml_jit_pages_set_writable (int writable);\n'
+                     '/* 弱定义让 mono 自己链接通过；最终 dylib 里 stub.c 的强定义会覆盖 */\n'
+                     '__attribute__((weak)) int ml_ios_jit_wx (void) { return 0; }\n'
+                     '__attribute__((weak)) void ml_jit_pages_register (void *addr, size_t length)\n'
+                     '{ (void)addr; (void)length; }\n'
+                     '__attribute__((weak)) void ml_jit_pages_set_writable (int writable) { (void)writable; }\n')
           anchor = 'static int\nprot_from_flags (int flags)\n{'
           if 'ml_ios_jit_wx' not in s:
               s = s.replace(anchor, externs + '\n' + anchor, 1)
