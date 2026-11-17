@@ -79,33 +79,74 @@ jobs:
           else:
               print('mmap: 目标代码不存在或已改过')
 
-          # iOS 会悄悄剥掉 mmap 时的执行位：按 RWX 映射拿到的页其实不可执行。
-          # 修法是先要 RW、再用 mprotect 把执行位补回来 —— mono 的跳板会在运行中
-          # 回填自身代码，所以这些页必须长期保持可写可执行，不能改成 W^X。
-          externs = ('\n/* 由 stub.c 提供：判断宿主是不是 iOS（没有 macOS 的硬件 JIT 开关） */\n'
-                     'extern int ml_ios_jit_rwx (void);\n'
-                     'extern void ml_ios_jit_report_failed (int err);\n')
+          # iOS 是严格 W^X：mmap/mprotect 里同时要「写+执行」时，内核**返回成功
+          # 但把执行位剥掉**（实测 0.13.6：mprotect RWX 成功，一跳进去就崩）。
+          # 所以只留一条路：代码页写入时 RW、执行时 RX，来回切。
+          # 两个补丁：映射阶段先要 RW 并登记区域；codeman 的写保护开关改成 mprotect。
+          externs = ('\n/* 由 stub.c 提供：iOS 判定与代码页登记/mprotect 切换 */\n'
+                     'extern int ml_ios_jit_wx (void);\n'
+                     'extern void ml_jit_pages_register (void *addr, size_t length);\n')
           anchor = 'static int\nprot_from_flags (int flags)\n{'
-          if 'ml_ios_jit_rwx' not in s:
+          if 'ml_ios_jit_wx' not in s:
               s = s.replace(anchor, externs + '\n' + anchor, 1)
               s = s.replace('\tif (flags & MONO_MMAP_EXEC)\n\t\tprot |= PROT_EXEC;',
                             '\t/* iOS 上带执行位的映射会被剥掉执行权限，先按 RW 拿内存 */\n'
-                            '\tif ((flags & MONO_MMAP_EXEC) && !((flags & MONO_MMAP_JIT) && ml_ios_jit_rwx ()))\n'
+                            '\tif ((flags & MONO_MMAP_EXEC) && !((flags & MONO_MMAP_JIT) && ml_ios_jit_wx ()))\n'
                             '\t\tprot |= PROT_EXEC;')
               ret = '\tif (ptr == MAP_FAILED)\n\t\treturn NULL;\n\n\tmono_account_mem (type, (ssize_t)length);'
               add = ('\tif (ptr == MAP_FAILED)\n\t\treturn NULL;\n\n'
-                     '\tif ((flags & MONO_MMAP_JIT) && ml_ios_jit_rwx ()) {\n'
-                     '\t\t/* iOS：mmap 时给的执行位会被剥掉，这里补回来 */\n'
-                     '\t\tif (mprotect (ptr, length, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)\n'
-                     '\t\t\tml_ios_jit_report_failed (errno);\n'
-                     '\t}\n\n'
+                     '\tif ((flags & MONO_MMAP_JIT) && ml_ios_jit_wx ())\n'
+                     '\t\tml_jit_pages_register (ptr, length);\n\n'
                      '\tmono_account_mem (type, (ssize_t)length);')
               if ret in s:
                   s = s.replace(ret, add, 1)
-                  print('mmap: 已加入 RWX 补执行位')
+                  print('mmap: 已加入代码页登记')
               else:
                   print('mmap: 没找到 mono_valloc 的返回点')
               open(p, 'w').write(s)
+
+          # codeman 的写保护：原来靠 macOS 的硬件开关（iOS 上不存在，我们只能塞空实现），
+          # 改成 iOS 走 mprotect。嵌套层次照抄它原来的 TLS 计数，只在最外层切换。
+          p = 'src/mono/mono/utils/mono-codeman.c'
+          c = open(p).read()
+          if 'ml_jit_pages_set_writable' not in c:
+              guard = '\tif (codeman_no_exec)\n\t\treturn;\n'
+              wx_enable = (
+                  '\tif (ml_ios_jit_wx ()) {\n'
+                  '\t\tint level = GPOINTER_TO_INT (mono_native_tls_get_value (write_level_tls_id));\n'
+                  '\t\tmono_native_tls_set_value (write_level_tls_id, GINT_TO_POINTER (level + 1));\n'
+                  '\t\tif (level == 0)\n'
+                  '\t\t\tml_jit_pages_set_writable (1);\n'
+                  '\t\treturn;\n'
+                  '\t}\n')
+              wx_disable = (
+                  '\tif (ml_ios_jit_wx ()) {\n'
+                  '\t\tint level = GPOINTER_TO_INT (mono_native_tls_get_value (write_level_tls_id));\n'
+                  '\t\tg_assert (level);\n'
+                  '\t\tmono_native_tls_set_value (write_level_tls_id, GINT_TO_POINTER (level - 1));\n'
+                  '\t\tif (level == 1)\n'
+                  '\t\t\tml_jit_pages_set_writable (0);\n'
+                  '\t\treturn;\n'
+                  '\t}\n')
+
+              def insert_after(text, marker, snippet):
+                  i = text.find(marker)
+                  if i < 0:
+                      return text, False
+                  j = text.find(guard, i)
+                  if j < 0:
+                      return text, False
+                  k = j + len(guard)
+                  return text[:k] + snippet + text[k:], True
+
+              c, ok_dis = insert_after(c, 'mono_codeman_disable_write (void)', wx_disable)
+              c, ok_en = insert_after(c, 'mono_codeman_enable_write (void)', wx_enable)
+              head = ('extern int ml_ios_jit_wx (void);\n'
+                      'extern void ml_jit_pages_set_writable (int writable);\n\n')
+              c = c.replace('void\nmono_codeman_enable_write (void)\n{',
+                            head + 'void\nmono_codeman_enable_write (void)\n{', 1)
+              open(p, 'w').write(c)
+              print('codeman: enable_write=%s disable_write=%s' % (ok_en, ok_dis))
           PY
 
 
@@ -154,10 +195,13 @@ jobs:
             printf '%s\n' \
               '#include <dlfcn.h>' \
               '#include <errno.h>' \
+              '#include <stddef.h>' \
               '#include <stdio.h>' \
+              '#include <sys/mman.h>' \
               '#include <unistd.h>' \
-              '/* 宿主有没有 macOS 的硬件 JIT 开关：没有就是 iOS */' \
-              'int ml_ios_jit_rwx(void)' \
+              'extern void sys_icache_invalidate(void *start, size_t len);' \
+              '/* 宿主是不是 iOS：没有 macOS 的硬件 JIT 写保护开关就是 */' \
+              'int ml_ios_jit_wx(void)' \
               '{' \
               '    static int decided = -1;' \
               '    if (decided < 0) {' \
@@ -166,13 +210,33 @@ jobs:
               '    }' \
               '    return decided;' \
               '}' \
-              '/* 补执行位失败时留一行痕迹：这时 mono 的日志还没初始化 */' \
-              'void ml_ios_jit_report_failed(int err)' \
+              '#define ML_JIT_MAX 512' \
+              'static void *g_jit_addr[ML_JIT_MAX];' \
+              'static size_t g_jit_len[ML_JIT_MAX];' \
+              'static int g_jit_count;' \
+              'void ml_jit_pages_register(void *addr, size_t length)' \
               '{' \
-              '    char buf[96];' \
-              '    int n = snprintf(buf, sizeof(buf), "mono: mprotect(RWX) 失败 errno=%d\n", err);' \
-              '    if (n > 0)' \
-              '        write(2, buf, (size_t)n);' \
+              '    int i;' \
+              '    for (i = 0; i < g_jit_count; i++)' \
+              '        if (g_jit_addr[i] == addr) return;' \
+              '    if (g_jit_count >= ML_JIT_MAX) return;' \
+              '    g_jit_addr[g_jit_count] = addr;' \
+              '    g_jit_len[g_jit_count] = length;' \
+              '    g_jit_count++;' \
+              '    mprotect(addr, length, PROT_READ | PROT_WRITE);' \
+              '}' \
+              '/* mono 每次开始/结束写代码都会调这里：写时 RW，执行时 RX */' \
+              'void ml_jit_pages_set_writable(int writable)' \
+              '{' \
+              '    int i;' \
+              '    for (i = 0; i < g_jit_count; i++) {' \
+              '        if (writable)' \
+              '            mprotect(g_jit_addr[i], g_jit_len[i], PROT_READ | PROT_WRITE);' \
+              '        else {' \
+              '            mprotect(g_jit_addr[i], g_jit_len[i], PROT_READ | PROT_EXEC);' \
+              '            sys_icache_invalidate(g_jit_addr[i], g_jit_len[i]);' \
+              '        }' \
+              '    }' \
               '}' \
               '/* 静态 mono 引用了 ICU 全球化入口，iOS 上走不到这里 */' \
               'void *GlobalizationResolveDllImport(const char *name)' \
