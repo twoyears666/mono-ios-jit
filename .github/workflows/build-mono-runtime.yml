@@ -62,12 +62,30 @@ jobs:
               print('补丁已存在')
           PY
 
+      - name: 适配 iOS 的代码页语义
+        working-directory: runtime
+        run: |
+          python3 - <<'PY'
+          # Apple Silicon 上 mono 会无条件给可执行页加 MAP_JIT，
+          # iOS 的 mmap 不认识这个标志（EINVAL）。
+          # 去掉这一处之后：macOS 走上面 hardened runtime 探测的结果，
+          # iOS 探测能直接拿到 RWX，于是走普通映射。
+          p = 'src/mono/mono/utils/mono-mmap.c'
+          s = open(p).read()
+          old = "\t\tif (__builtin_available (macOS 11, *))\n\t\t\tmflags |= MAP_JIT;"
+          if old in s:
+              s = s.replace(old, "\t\t/* iOS 不认 MAP_JIT，保持普通 RWX */")
+              open(p, 'w').write(s)
+              print('mmap: 已移除强制 MAP_JIT')
+          else:
+              print('mmap: 目标代码不存在或已改过')
+          PY
+
       - name: 编译 Mono 运行库
         working-directory: runtime
         run: |
           set -o pipefail   # 不加的话 tee 会把 build.sh 的失败退出码吞掉
           ./build.sh mono.runtime -os osx -arch arm64 -c Release 2>&1 | tee ../build.log
-
       - name: 找出产物 dylib
         run: |
           find runtime/artifacts -name 'libmonosgen-2.0.dylib' -o -name 'libmonosgen-2.0.*.dylib' | head -20
@@ -106,11 +124,26 @@ jobs:
             # 用 printf 写 stub：YAML 块标量会给每行补缩进，
             # heredoc 的结束符会被缩进带走，导致 shell 提前报 EOF
             printf '%s\n' \
+              '#include <dlfcn.h>' \
               '/* 静态 mono 引用了 ICU 全球化入口，iOS 上走不到这里 */' \
               'void *GlobalizationResolveDllImport(const char *name)' \
               '{' \
               '    (void)name;' \
               '    return 0;' \
+              '}' \
+              '/* iOS 的 libSystem 没有这个接口，有就转发，没有就空操作 */' \
+              'void pthread_jit_write_protect_np(int enabled)' \
+              '{' \
+              '    static void (*real)(int);' \
+              '    static int looked;' \
+              '    if (!looked) {' \
+              '        void *lib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);' \
+              '        if (lib != NULL)' \
+              '            real = (void (*)(int))dlsym(lib, "pthread_jit_write_protect_np");' \
+              '        looked = 1;' \
+              '    }' \
+              '    if (real != NULL)' \
+              '        real(enabled);' \
               '}' > stub.c
             # 静态 mono 需要整包链入：icall 注册表靠 section 里的符号表，
             # 不加 -all_load 链接器会把没人引用的 icall 全丢掉
@@ -139,6 +172,12 @@ jobs:
             echo "仍有 macOS 框架路径未改写" >&2
             exit 1
           fi
+          # 这个符号只有 Apple Silicon macOS 有，必须由我们自带实现，
+          # 否则真机 dlopen 直接报 Symbol not found
+          nm -g "out/$OUT_DYLIB" | grep -q " T _pthread_jit_write_protect_np" || {
+            echo "缺少 pthread_jit_write_protect_np 实现" >&2
+            exit 1
+          }
           codesign -f -s - "out/$OUT_DYLIB"
           otool -l "out/$OUT_DYLIB" | grep -A3 LC_BUILD_VERSION | head -6
           codesign -dvv "out/$OUT_DYLIB" 2>&1 | head -5
