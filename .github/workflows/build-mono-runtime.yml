@@ -75,11 +75,39 @@ jobs:
           old = "\t\tif (__builtin_available (macOS 11, *))\n\t\t\tmflags |= MAP_JIT;"
           if old in s:
               s = s.replace(old, "\t\t/* iOS 不认 MAP_JIT，保持普通 RWX */")
-              open(p, 'w').write(s)
               print('mmap: 已移除强制 MAP_JIT')
           else:
               print('mmap: 目标代码不存在或已改过')
+
+          # iOS 会悄悄剥掉 mmap 时的执行位：按 RWX 映射拿到的页其实不可执行。
+          # 修法是先要 RW、再用 mprotect 把执行位补回来 —— mono 的跳板会在运行中
+          # 回填自身代码，所以这些页必须长期保持可写可执行，不能改成 W^X。
+          externs = ('\n/* 由 stub.c 提供：判断宿主是不是 iOS（没有 macOS 的硬件 JIT 开关） */\n'
+                     'extern int ml_ios_jit_rwx (void);\n'
+                     'extern void ml_ios_jit_report_failed (int err);\n')
+          anchor = 'static int\nprot_from_flags (int flags)\n{'
+          if 'ml_ios_jit_rwx' not in s:
+              s = s.replace(anchor, externs + '\n' + anchor, 1)
+              s = s.replace('\tif (flags & MONO_MMAP_EXEC)\n\t\tprot |= PROT_EXEC;',
+                            '\t/* iOS 上带执行位的映射会被剥掉执行权限，先按 RW 拿内存 */\n'
+                            '\tif ((flags & MONO_MMAP_EXEC) && !((flags & MONO_MMAP_JIT) && ml_ios_jit_rwx ()))\n'
+                            '\t\tprot |= PROT_EXEC;')
+              ret = '\tif (ptr == MAP_FAILED)\n\t\treturn NULL;\n\n\tmono_account_mem (type, (ssize_t)length);'
+              add = ('\tif (ptr == MAP_FAILED)\n\t\treturn NULL;\n\n'
+                     '\tif ((flags & MONO_MMAP_JIT) && ml_ios_jit_rwx ()) {\n'
+                     '\t\t/* iOS：mmap 时给的执行位会被剥掉，这里补回来 */\n'
+                     '\t\tif (mprotect (ptr, length, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)\n'
+                     '\t\t\tml_ios_jit_report_failed (errno);\n'
+                     '\t}\n\n'
+                     '\tmono_account_mem (type, (ssize_t)length);')
+              if ret in s:
+                  s = s.replace(ret, add, 1)
+                  print('mmap: 已加入 RWX 补执行位')
+              else:
+                  print('mmap: 没找到 mono_valloc 的返回点')
+              open(p, 'w').write(s)
           PY
+
 
       - name: 编译 Mono 运行库
         working-directory: runtime
@@ -125,6 +153,27 @@ jobs:
             # heredoc 的结束符会被缩进带走，导致 shell 提前报 EOF
             printf '%s\n' \
               '#include <dlfcn.h>' \
+              '#include <errno.h>' \
+              '#include <stdio.h>' \
+              '#include <unistd.h>' \
+              '/* 宿主有没有 macOS 的硬件 JIT 开关：没有就是 iOS */' \
+              'int ml_ios_jit_rwx(void)' \
+              '{' \
+              '    static int decided = -1;' \
+              '    if (decided < 0) {' \
+              '        void *lib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);' \
+              '        decided = (lib == 0 || dlsym(lib, "pthread_jit_write_protect_np") == 0);' \
+              '    }' \
+              '    return decided;' \
+              '}' \
+              '/* 补执行位失败时留一行痕迹：这时 mono 的日志还没初始化 */' \
+              'void ml_ios_jit_report_failed(int err)' \
+              '{' \
+              '    char buf[96];' \
+              '    int n = snprintf(buf, sizeof(buf), "mono: mprotect(RWX) 失败 errno=%d\n", err);' \
+              '    if (n > 0)' \
+              '        write(2, buf, (size_t)n);' \
+              '}' \
               '/* 静态 mono 引用了 ICU 全球化入口，iOS 上走不到这里 */' \
               'void *GlobalizationResolveDllImport(const char *name)' \
               '{' \
