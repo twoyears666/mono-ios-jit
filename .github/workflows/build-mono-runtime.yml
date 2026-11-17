@@ -138,11 +138,11 @@ jobs:
               '    static int looked;' \
               '    if (!looked) {' \
               '        void *lib = dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOW);' \
-              '        if (lib != NULL)' \
+              '        if (lib != 0)' \
               '            real = (void (*)(int))dlsym(lib, "pthread_jit_write_protect_np");' \
               '        looked = 1;' \
               '    }' \
-              '    if (real != NULL)' \
+              '    if (real != 0)' \
               '        real(enabled);' \
               '}' > stub.c
             # 静态 mono 需要整包链入：icall 注册表靠 section 里的符号表，
